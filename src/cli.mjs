@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { acquireSingleInstanceLock } from "./lock.mjs";
 import {
   resolveCopilotHome,
   resolveT3Cli,
@@ -237,6 +238,12 @@ export async function main(argv) {
     return;
   }
 
+  const lockServer = await acquireSingleInstanceLock(t3Home);
+  if (!lockServer) {
+    console.log(`[${new Date().toISOString()}] another watcher is already running for ${t3Home}; exiting`);
+    return;
+  }
+
   console.log(
     `[${new Date().toISOString()}] starting ${pkg.name} v${pkg.version} (minTokens=${config.minTokens}, idle=${config.idleMinSec}s..${config.idleMaxSec}s, poll=${config.pollSec}s${opts.dryRun ? ", DRY-RUN" : ""})`,
   );
@@ -248,6 +255,7 @@ export async function main(argv) {
     if (stopped) return;
     stopped = true;
     if (timer) clearTimeout(timer);
+    lockServer.close();
     console.log(`[${new Date().toISOString()}] received ${signal}, shutting down`);
   };
 

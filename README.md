@@ -26,9 +26,10 @@ When you keep long T3 Code threads (~200k–1M context) open and step away for >
    - Context size `>= 150,000` tokens (configurable)
    - Idle for **`4m00s`–`4m50s`** (`240s`–`290s`) — never compacts after the 5m cache has already gone cold (e.g., after sleep/restart)
    - Latest run is `completed` with no active or queued runs
-   - No pending approval/user-input requests, subagents, merge-backs, or running turn items
+   - No pending approval/user-input requests, subagents, merge-backs, or running turn items (unfinished `todo_list` items do not block compaction)
    - Not archived, deleted, settled, or snoozed
    - Latest turn was **not** already `/compact` **and** this `(threadId, latestRunId)` hasn't already been compacted (persisted across restarts to prevent loops)
+5. Enforces a single running watcher instance per T3 home directory so duplicate watchers exit cleanly.
 
 ---
 

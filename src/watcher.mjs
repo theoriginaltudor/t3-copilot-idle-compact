@@ -448,7 +448,7 @@ function hasPendingThreadWork(t3Db, threadId) {
     const item = t3Db
       .prepare(
         `SELECT status FROM orchestration_v2_projection_turn_items
-         WHERE thread_id = ? AND status IN ('pending', 'running', 'waiting') LIMIT 1`,
+         WHERE thread_id = ? AND status IN ('pending', 'running', 'waiting') AND type <> 'todo_list' LIMIT 1`,
       )
       .get(threadId);
     if (item) return true;
