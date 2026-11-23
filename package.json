@@ -1,0 +1,27 @@
+{
+  "name": "t3-copilot-idle-compact",
+  "version": "0.1.0",
+  "description": "Automatically compact idle GitHub Copilot CLI threads in T3 Code before the 5-minute prompt cache expires.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "t3-copilot-idle-compact": "./bin/t3-copilot-idle-compact.mjs"
+  },
+  "scripts": {
+    "start": "node ./bin/t3-copilot-idle-compact.mjs",
+    "status": "node ./bin/t3-copilot-idle-compact.mjs --status",
+    "dry-run": "node ./bin/t3-copilot-idle-compact.mjs --once --dry-run --verbose",
+    "test": "node --test"
+  },
+  "keywords": [
+    "t3-code",
+    "github-copilot",
+    "copilot-cli",
+    "prompt-cache",
+    "compact",
+    "acp"
+  ]
+}
