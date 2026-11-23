@@ -126,6 +126,10 @@ Every option can be passed as a CLI flag or environment variable:
 npm test
 ```
 
+## Contributing
+
+Pull requests are welcome! See [CONTRIBUTING.md](./CONTRIBUTING.md) for development and PR guidelines.
+
 ## License
 
 MIT
