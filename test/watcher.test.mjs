@@ -589,23 +589,42 @@ describe("evaluateThreads guards", () => {
     t3Db.close();
   });
 
-  it("ignores running todo_list turn items but blocks on running command_execution items", () => {
+  it("ignores stale running turn_items (e.g. assistant_message or todo_list from completed/historical runs)", () => {
     const t3Db = new DatabaseSync(":memory:");
     createT3Schema(t3Db);
-    seedCopilotThread(t3Db, { threadId: "t-todo-only", completedAt, usedTokens: 250_000 });
-    seedCopilotThread(t3Db, { threadId: "t-cmd-running", completedAt, usedTokens: 250_000 });
+    seedCopilotThread(t3Db, { threadId: "t-stale-historical", runId: "run-10", completedAt, usedTokens: 250_000 });
+    seedCopilotThread(t3Db, { threadId: "t-stale-latest", runId: "run-latest", completedAt, usedTokens: 250_000 });
+
+    // Older completed run 6 (e.g. before a worktree move) left a stale running assistant_message turn item
+    t3Db
+      .prepare(
+        `INSERT INTO orchestration_v2_projection_runs
+         (run_id, thread_id, ordinal, provider, provider_thread_id, status, requested_at, completed_at, payload_json, provider_instance_id)
+         VALUES ('run-6', 't-stale-historical', 0, 'acpRegistry', 'pt-t-stale-historical', 'completed', ?, ?, '{}', 'github-copilot')`,
+      )
+      .run(completedAt, completedAt);
 
     const insertTurnItem = t3Db.prepare(
       `INSERT INTO orchestration_v2_projection_turn_items
        (item_id, thread_id, run_id, node_id, provider_thread_id, provider_turn_id, parent_item_id, ordinal, type, status, updated_at, payload_json)
-       VALUES (?, ?, ?, 'node-1', ?, 'turn-1', NULL, 1, ?, 'running', ?, '{}')`,
+       VALUES (?, ?, ?, 'node-1', ?, 'turn-1', NULL, ?, ?, 'running', ?, '{}')`,
     );
-    insertTurnItem.run("item-todo", "t-todo-only", "run-t-todo-only", "pt-t-todo-only", "todo_list", completedAt);
+    insertTurnItem.run(
+      "item-stale-msg",
+      "t-stale-historical",
+      "run-6",
+      "pt-t-stale-historical",
+      1,
+      "assistant_message",
+      completedAt,
+    );
+    insertTurnItem.run("item-todo", "t-stale-latest", "run-latest", "pt-t-stale-latest", 1, "todo_list", completedAt);
     insertTurnItem.run(
       "item-cmd",
-      "t-cmd-running",
-      "run-t-cmd-running",
-      "pt-t-cmd-running",
+      "t-stale-latest",
+      "run-latest",
+      "pt-t-stale-latest",
+      2,
       "command_execution",
       completedAt,
     );
@@ -619,13 +638,51 @@ describe("evaluateThreads guards", () => {
       nowMs: completedMs + 250_000,
     });
 
-    const todoThread = res.find((x) => x.threadId === "t-todo-only");
-    assert.equal(todoThread.eligible, true);
-    assert.equal(todoThread.reason, "eligible");
+    const historicalThread = res.find((x) => x.threadId === "t-stale-historical");
+    assert.equal(historicalThread.eligible, true);
+    assert.equal(historicalThread.reason, "eligible");
 
-    const cmdThread = res.find((x) => x.threadId === "t-cmd-running");
-    assert.equal(cmdThread.eligible, false);
-    assert.equal(cmdThread.reason, "pending_work_or_approval");
+    const latestThread = res.find((x) => x.threadId === "t-stale-latest");
+    assert.equal(latestThread.eligible, true);
+    assert.equal(latestThread.reason, "eligible");
+    t3Db.close();
+  });
+
+  it("blocks on active/waiting runs, active subagents, and pending merge-back context transfers", () => {
+    const t3Db = new DatabaseSync(":memory:");
+    createT3Schema(t3Db);
+    seedCopilotThread(t3Db, { threadId: "t-waiting-run", runStatus: "waiting", completedAt, usedTokens: 250_000 });
+    seedCopilotThread(t3Db, { threadId: "t-subagent", completedAt, usedTokens: 250_000 });
+    seedCopilotThread(t3Db, { threadId: "t-merge-back", completedAt, usedTokens: 250_000 });
+
+    t3Db
+      .prepare(
+        `INSERT INTO orchestration_v2_projection_subagents
+         (subagent_id, thread_id, run_id, parent_node_id, provider, provider_thread_id, child_thread_id, origin, status, started_at, completed_at, updated_at, payload_json)
+         VALUES ('sub-1', 't-subagent', 'run-t-subagent', 'node-1', 'acpRegistry', NULL, 'child-1', 'delegate', 'running', ?, NULL, ?, '{}')`,
+      )
+      .run(completedAt, completedAt);
+
+    t3Db
+      .prepare(
+        `INSERT INTO orchestration_v2_projection_context_transfers
+         (context_transfer_id, source_thread_id, target_thread_id, target_run_id, type, status, source_provider, target_provider, updated_at, payload_json)
+         VALUES ('xfer-1', 'child-2', 't-merge-back', NULL, 'merge_back', 'pending', 'acpRegistry', 'acpRegistry', ?, '{}')`,
+      )
+      .run(completedAt);
+
+    const res = evaluateThreads({
+      t3Db,
+      copilotDb: null,
+      copilotInstances: instances,
+      state: { version: 1, threads: {} },
+      config: DEFAULT_CONFIG,
+      nowMs: completedMs + 250_000,
+    });
+
+    assert.equal(res.find((x) => x.threadId === "t-waiting-run").reason, "run_waiting");
+    assert.equal(res.find((x) => x.threadId === "t-subagent").reason, "pending_work_or_approval");
+    assert.equal(res.find((x) => x.threadId === "t-merge-back").reason, "pending_work_or_approval");
     t3Db.close();
   });
 });

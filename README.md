@@ -26,8 +26,8 @@ When you keep long T3 Code threads (~200k–1M context) open and step away for >
 5. For each top-level Copilot thread, sends `/compact` via the official `t3 thread send <threadId> /compact` CLI **only if all guards pass**:
    - Context size `>= 200,000` tokens (configurable; matches Claude Code's `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` default)
    - Cache age **`4m00s`–`4m45s`** (`240s`–`285s`) since the start of the last API request — leaves headroom for dispatch and never compacts after the 5m cache has already gone cold (e.g., after sleep/restart)
-   - Latest run is `completed` with no active or queued runs
-   - No pending approval/user-input requests, subagents, merge-backs, or running turn items (unfinished `todo_list` items do not block compaction)
+   - Latest run is `completed` with no active, queued, or waiting runs
+   - No pending approval/user-input requests, active subagents, or pending merge-backs (stale `turn_items` left in `running` state from completed or moved runs do not block compaction)
    - Not archived, deleted, settled, or snoozed
    - Latest turn was **not** already `/compact`, latest session usage event was **not** already an internal `compaction`, **and** this `(threadId, latestRunId)` hasn't already been compacted (persisted across restarts to prevent loops)
 6. Enforces a single running watcher instance per T3 home directory so duplicate watchers exit cleanly.

@@ -25,7 +25,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   waitTimeoutMs: 180_000,
 });
 
-const ACTIVE_RUN_STATUSES = new Set(["preparing", "starting", "running", "queued"]);
+const ACTIVE_RUN_STATUSES = new Set(["preparing", "starting", "running", "queued", "waiting"]);
 const PENDING_WORK_STATUSES = new Set(["pending", "starting", "running", "waiting"]);
 const THREAD_ID_PATTERN = /^[A-Za-z0-9:._-]+$/;
 const MAX_STATE_ENTRIES = 500;
@@ -506,7 +506,7 @@ export function evaluateThreads({
       continue;
     }
 
-    // Check pending approvals / user input requests / subagents / merge-backs / running items
+    // Check pending approvals / user input requests / subagents / merge-backs
     if (hasPendingThreadWork(t3Db, row.thread_id)) {
       results.push({ ...base, reason: "pending_work_or_approval" });
       continue;
@@ -571,18 +571,6 @@ function hasPendingThreadWork(t3Db, threadId) {
       )
       .get(threadId);
     if (xfer) return true;
-  } catch {
-    // ignore missing table
-  }
-
-  try {
-    const item = t3Db
-      .prepare(
-        `SELECT status FROM orchestration_v2_projection_turn_items
-         WHERE thread_id = ? AND status IN ('pending', 'running', 'waiting') AND type <> 'todo_list' LIMIT 1`,
-      )
-      .get(threadId);
-    if (item) return true;
   } catch {
     // ignore missing table
   }
