@@ -21,15 +21,16 @@ When you keep long T3 Code threads (~200k–1M context) open and step away for >
 
 1. Polls T3 Code's local SQLite state (`~/.t3/userdata/statev2.sqlite`, opened strictly **read-only** and closed after each sweep so WAL checkpointing is never blocked).
 2. Auto-detects enabled GitHub Copilot CLI provider instances from `~/.t3/userdata/settings.json` (`acpRegistry` instances with `agentId: "github-copilot-cli"`, `copilot` executable, or Copilot instance ID).
-3. Reads context token usage from T3 Code's `provider_threads` (`contextUsage.usedTokens`) with automatic fallback to Copilot CLI's `~/.copilot/session-store.db` (`assistant_usage_events`).
-4. For each top-level Copilot thread, sends `/compact` via the official `t3 thread send <threadId> /compact` CLI **only if all guards pass**:
-   - Context size `>= 150,000` tokens (configurable)
-   - Idle for **`4m00s`–`4m50s`** (`240s`–`290s`) — never compacts after the 5m cache has already gone cold (e.g., after sleep/restart)
+3. Reads context token usage from T3 Code's `provider_threads` (`contextUsage.usedTokens`) with automatic fallback to Copilot CLI's `~/.copilot/session-store.db` (`assistant_usage_events`, main-agent rows only).
+4. Anchors the 5-minute prompt cache timer to the **start of the last LLM API request** (`created_at - duration_ms` from `assistant_usage_events`, covering post-tool-call requests and long response generation) with automatic fallback to T3 Code's `completed_at`.
+5. For each top-level Copilot thread, sends `/compact` via the official `t3 thread send <threadId> /compact` CLI **only if all guards pass**:
+   - Context size `>= 200,000` tokens (configurable; matches Claude Code's `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` default)
+   - Cache age **`4m00s`–`4m45s`** (`240s`–`285s`) since the start of the last API request — leaves headroom for dispatch and never compacts after the 5m cache has already gone cold (e.g., after sleep/restart)
    - Latest run is `completed` with no active or queued runs
    - No pending approval/user-input requests, subagents, merge-backs, or running turn items (unfinished `todo_list` items do not block compaction)
    - Not archived, deleted, settled, or snoozed
-   - Latest turn was **not** already `/compact` **and** this `(threadId, latestRunId)` hasn't already been compacted (persisted across restarts to prevent loops)
-5. Enforces a single running watcher instance per T3 home directory so duplicate watchers exit cleanly.
+   - Latest turn was **not** already `/compact`, latest session usage event was **not** already an internal `compaction`, **and** this `(threadId, latestRunId)` hasn't already been compacted (persisted across restarts to prevent loops)
+6. Enforces a single running watcher instance per T3 home directory so duplicate watchers exit cleanly.
 
 ---
 
@@ -57,6 +58,19 @@ node ./bin/t3-copilot-idle-compact.mjs --once --dry-run --verbose
 node ./bin/t3-copilot-idle-compact.mjs
 ```
 
+### Before Sleep / On-Demand Compaction
+
+If you're about to close your laptop lid or put it to sleep right after finishing a big thread, the background timer won't run while the machine is asleep. Run `compact-now` to immediately compact every warm thread (`>= 200k` tokens and still under the 5-minute cache limit) in parallel and wait until finished:
+
+```bash
+# Compact all warm threads >= 200k right now and wait until safe to sleep
+npm run compact-now
+# or: node ./bin/t3-copilot-idle-compact.mjs --now
+
+# Preview which warm threads would be compacted without sending /compact
+npm run compact-now -- --dry-run
+```
+
 ---
 
 ## Run in the Background
@@ -78,7 +92,7 @@ Run in PowerShell:
 ```powershell
 .\scripts\install-windows.ps1
 # Custom threshold / window example:
-.\scripts\install-windows.ps1 -MinTokens 150000 -IdleMinSec 240 -IdleMaxSec 290 -PollSec 15
+.\scripts\install-windows.ps1 -MinTokens 200000 -IdleMinSec 240 -IdleMaxSec 285 -PollSec 15
 
 # View logs
 Get-Content "$env:LOCALAPPDATA\t3-copilot-idle-compact\watcher.log" -Wait
@@ -105,9 +119,9 @@ Every option can be passed as a CLI flag or environment variable:
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--min-tokens <n>` | `T3_COMPACT_MIN_TOKENS` | `150000` | Minimum context tokens before compacting |
-| `--idle-min <sec>` | `T3_COMPACT_IDLE_MIN_SEC` | `240` | Minimum idle time in seconds (`4m00s`) |
-| `--idle-max <sec>` | `T3_COMPACT_IDLE_MAX_SEC` | `290` | Maximum idle time in seconds (`4m50s`, skips cold cache) |
+| `--min-tokens <n>` | `T3_COMPACT_MIN_TOKENS` | `200000` | Minimum context tokens before compacting |
+| `--idle-min <sec>` | `T3_COMPACT_IDLE_MIN_SEC` | `240` | Minimum cache age in seconds (`4m00s` from last request start) |
+| `--idle-max <sec>` | `T3_COMPACT_IDLE_MAX_SEC` | `285` | Maximum cache age in seconds (`4m45s`, skips cold cache) |
 | `--poll <sec>` | `T3_COMPACT_POLL_SEC` | `15` | Poll interval in seconds |
 | `--providers <csv>` | `T3_COMPACT_PROVIDERS` | auto | Comma-separated T3 `providerInstanceId`s to monitor |
 | `--t3-home <dir>` | `T3CODE_HOME` | `~/.t3` | T3 Code data directory |
@@ -115,6 +129,10 @@ Every option can be passed as a CLI flag or environment variable:
 | `--t3-cli <path>` | `T3_CLI` | auto | Explicit path to the `t3` CLI binary |
 | `--state-file <path>` | `T3_COMPACT_STATE_FILE` | `~/.t3/userdata/copilot-idle-compact-state.json` | Persistent dedupe state file |
 | `--status` | — | `false` | Print all active Copilot threads & eligibility and exit |
+| `--warm` | — | `false` | List warm threads worth compacting right now (`0s..idleMax`, `>= minTokens`) |
+| `--now` | — | `false` | Compact all warm threads right now and wait for completion (safe before sleep) |
+| `-i`, `--interactive` | — | `false` | With `--now`, prompt `[y/N]` before compacting |
+| `--wait` / `--no-wait` | — | auto | Wait for `/compact` to finish (`true` for `--now`, `false` for daemon) |
 | `--once` | — | `false` | Run one sweep and exit |
 | `--dry-run` | — | `false` | Evaluate and log without sending `/compact` |
 | `-v`, `--verbose` | — | `false` | Log skipped threads on every sweep |

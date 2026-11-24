@@ -11,9 +11,9 @@ PLIST_PATH="$PLIST_DIR/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs"
 LOG_PATH="$LOG_DIR/t3-copilot-idle-compact.log"
 
-MIN_TOKENS="${T3_COMPACT_MIN_TOKENS:-150000}"
+MIN_TOKENS="${T3_COMPACT_MIN_TOKENS:-200000}"
 IDLE_MIN="${T3_COMPACT_IDLE_MIN_SEC:-240}"
-IDLE_MAX="${T3_COMPACT_IDLE_MAX_SEC:-290}"
+IDLE_MAX="${T3_COMPACT_IDLE_MAX_SEC:-285}"
 POLL_SEC="${T3_COMPACT_POLL_SEC:-15}"
 
 if [[ -z "$NODE_BIN" ]]; then
@@ -64,6 +64,12 @@ cat > "$PLIST_PATH" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 20); do
+  if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 

@@ -4,9 +4,9 @@
   that starts automatically when you sign in.
 #>
 param(
-  [int]$MinTokens = 150000,
+  [int]$MinTokens = 200000,
   [int]$IdleMinSec = 240,
-  [int]$IdleMaxSec = 290,
+  [int]$IdleMaxSec = 285,
   [int]$PollSec = 15
 )
 

@@ -13,6 +13,7 @@
   "scripts": {
     "start": "node ./bin/t3-copilot-idle-compact.mjs",
     "status": "node ./bin/t3-copilot-idle-compact.mjs --status",
+    "compact-now": "node ./bin/t3-copilot-idle-compact.mjs --now",
     "dry-run": "node ./bin/t3-copilot-idle-compact.mjs --once --dry-run --verbose",
     "test": "node --test"
   },

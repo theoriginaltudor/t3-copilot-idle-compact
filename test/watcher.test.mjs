@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { parseArgs } from "../src/cli.mjs";
 import { buildT3CliInvocation, resolveT3Cli } from "../src/paths.mjs";
 import {
   DEFAULT_CONFIG,
@@ -11,6 +12,7 @@ import {
   evaluateThreads,
   isCopilotProviderInstance,
   loadState,
+  parseUtcTimestampMs,
   runSweep,
   saveState,
 } from "../src/watcher.mjs";
@@ -150,11 +152,15 @@ function createCopilotSchema(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
       turn_index INTEGER,
+      agent_id TEXT,
+      parent_tool_call_id TEXT,
       model TEXT NOT NULL,
       input_tokens INTEGER,
       output_tokens INTEGER,
       cache_read_tokens INTEGER,
       cache_write_tokens INTEGER,
+      duration_ms INTEGER,
+      initiator TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
@@ -168,6 +174,7 @@ function seedCopilotThread(
     providerInstanceId = "github-copilot",
     runId = `run-${threadId}`,
     runStatus = "completed",
+    requestedAt,
     completedAt = "2026-11-23T02:00:00.000Z",
     userMessageText = "Implement feature X",
     usedTokens = 210_000,
@@ -175,6 +182,7 @@ function seedCopilotThread(
     threadPayloadExtra = {},
   } = {},
 ) {
+  const effectiveRequestedAt = requestedAt ?? completedAt;
   const ptId = `pt-${threadId}`;
   const msgId = `msg-${runId}`;
 
@@ -234,13 +242,13 @@ function seedCopilotThread(
       threadId,
       ptId,
       runStatus,
-      completedAt,
+      effectiveRequestedAt,
       completedAt,
       JSON.stringify({
         id: runId,
         providerInstanceId,
         userMessageId: msgId,
-        startedAt: completedAt,
+        startedAt: effectiveRequestedAt,
       }),
       providerInstanceId,
     );
@@ -336,7 +344,7 @@ describe("evaluateThreads guards", () => {
   const completedMs = Date.parse(completedAt);
   const instances = new Set(["github-copilot"]);
 
-  it("marks a thread eligible inside the 4m00s..4m50s window when tokens >= 150k", () => {
+  it("marks a thread eligible inside the 4m00s..4m45s window when tokens >= 200k", () => {
     const t3Db = new DatabaseSync(":memory:");
     createT3Schema(t3Db);
     seedCopilotThread(t3Db, { completedAt, usedTokens: 200_000 });
@@ -354,6 +362,7 @@ describe("evaluateThreads guards", () => {
     assert.equal(res[0].eligible, true);
     assert.equal(res[0].reason, "eligible");
     assert.equal(res[0].usedTokens, 200_000);
+    assert.equal(res[0].idleSource, "t3.completedAt");
     t3Db.close();
   });
 
@@ -367,7 +376,7 @@ describe("evaluateThreads guards", () => {
     copilotDb
       .prepare(
         `INSERT INTO assistant_usage_events (session_id, turn_index, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
-         VALUES ('sess-abc', 4, 'claude-sonnet-4.5', 180000, 1200, 170000, 0)`,
+         VALUES ('sess-abc', 4, 'claude-opus-5.5', 220000, 1200, 210000, 0)`,
       )
       .run();
 
@@ -381,16 +390,129 @@ describe("evaluateThreads guards", () => {
     });
 
     assert.equal(res[0].eligible, true);
-    assert.equal(res[0].usedTokens, 181_200);
+    assert.equal(res[0].usedTokens, 221_200);
     assert.equal(res[0].tokenSource, "copilot.sessionStore");
+    // Unrelated wall-clock default created_at falls back cleanly to t3.completedAt
+    assert.equal(res[0].idleSource, "t3.completedAt");
     t3Db.close();
     copilotDb.close();
   });
 
-  it("skips threads below minTokens, not idle enough, or past cache expiry", () => {
+  it("anchors cache age to last LLM request start (created_at - duration_ms), including post-tool-call turns", () => {
+    const t3Db = new DatabaseSync(":memory:");
+    const copilotDb = new DatabaseSync(":memory:");
+    createT3Schema(t3Db);
+    createCopilotSchema(copilotDb);
+
+    // Run started at 01:57:00 (tool calls), final LLM request started at 01:59:00 and finished at 02:00:00 (60s duration)
+    seedCopilotThread(t3Db, {
+      requestedAt: "2026-11-23T01:57:00.000Z",
+      completedAt: "2026-11-23T02:00:00.000Z",
+      usedTokens: 260_000,
+      nativeSessionId: "sess-timing",
+    });
+
+    // Earlier tool-call request (should be ignored in favor of latest main-agent request)
+    copilotDb
+      .prepare(
+        `INSERT INTO assistant_usage_events
+         (session_id, turn_index, agent_id, parent_tool_call_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, initiator, created_at)
+         VALUES ('sess-timing', 1, NULL, NULL, 'claude-opus-5.5', 240000, 500, 230000, 0, 15000, 'user', '2026-11-23T01:57:20.000Z')`,
+      )
+      .run();
+
+    // Final main-agent LLM request after tool call: started 01:59:00, finished 02:00:00 (duration_ms = 60_000)
+    copilotDb
+      .prepare(
+        `INSERT INTO assistant_usage_events
+         (session_id, turn_index, agent_id, parent_tool_call_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, initiator, created_at)
+         VALUES ('sess-timing', 1, NULL, NULL, 'claude-opus-5.5', 258000, 2000, 250000, 0, 60000, 'agent', '2026-11-23T02:00:00.000Z')`,
+      )
+      .run();
+
+    // Subagent event later in the session must be ignored
+    copilotDb
+      .prepare(
+        `INSERT INTO assistant_usage_events
+         (session_id, turn_index, agent_id, parent_tool_call_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, initiator, created_at)
+         VALUES ('sess-timing', 1, 'sub-1', 'tc-1', 'claude-sonnet-4.5', 15000, 200, 10000, 0, 2000, 'agent', '2026-11-23T02:00:01.000Z')`,
+      )
+      .run();
+
+    // At 02:03:10 (only 3m10s after completedAt, but 4m10s since last request start at 01:59:00) -> ELIGIBLE!
+    const inWindow = evaluateThreads({
+      t3Db,
+      copilotDb,
+      copilotInstances: instances,
+      state: { version: 1, threads: {} },
+      config: DEFAULT_CONFIG,
+      nowMs: completedMs + 190_000,
+    });
+    assert.equal(inWindow[0].eligible, true);
+    assert.equal(inWindow[0].idleSource, "copilot.lastRequestStart");
+    assert.equal(inWindow[0].idleMs, 250_000);
+    assert.equal(inWindow[0].cacheAnchorAt, "2026-11-23T01:59:00.000Z");
+
+    // At 02:03:50 (3m50s after completedAt, but 4m50s > 4m45s since 01:59:00) -> cache_expired!
+    const expired = evaluateThreads({
+      t3Db,
+      copilotDb,
+      copilotInstances: instances,
+      state: { version: 1, threads: {} },
+      config: DEFAULT_CONFIG,
+      nowMs: completedMs + 230_000,
+    });
+    assert.equal(expired[0].eligible, false);
+    assert.match(expired[0].reason, /^cache_expired\(290s>285s\)/);
+
+    t3Db.close();
+    copilotDb.close();
+  });
+
+  it("parses SQLite UTC datetime strings as UTC and skips internal compaction events", () => {
+    assert.equal(parseUtcTimestampMs("2026-11-23 02:00:00"), Date.parse("2026-11-23T02:00:00Z"));
+    assert.equal(parseUtcTimestampMs("2026-11-23T02:00:00.123Z"), Date.parse("2026-11-23T02:00:00.123Z"));
+
+    const t3Db = new DatabaseSync(":memory:");
+    const copilotDb = new DatabaseSync(":memory:");
+    createT3Schema(t3Db);
+    createCopilotSchema(copilotDb);
+
+    seedCopilotThread(t3Db, {
+      requestedAt: "2026-11-23T01:59:40.000Z",
+      completedAt: "2026-11-23T02:00:00.000Z",
+      usedTokens: 250_000,
+      nativeSessionId: "sess-compacted",
+    });
+
+    copilotDb
+      .prepare(
+        `INSERT INTO assistant_usage_events
+         (session_id, turn_index, agent_id, parent_tool_call_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, initiator, created_at)
+         VALUES ('sess-compacted', 2, NULL, NULL, 'claude-opus-5.5', 250000, 1200, 240000, 0, 8000, 'compaction', '2026-11-23 02:00:00')`,
+      )
+      .run();
+
+    const res = evaluateThreads({
+      t3Db,
+      copilotDb,
+      copilotInstances: instances,
+      state: { version: 1, threads: {} },
+      config: DEFAULT_CONFIG,
+      nowMs: completedMs + 250_000,
+    });
+
+    assert.equal(res[0].eligible, false);
+    assert.equal(res[0].reason, "already_compacted_in_session");
+    assert.equal(res[0].idleSource, "copilot.lastRequestStart");
+    t3Db.close();
+    copilotDb.close();
+  });
+
+  it("skips threads below 200k minTokens, not idle enough, or past cache expiry", () => {
     const t3Db = new DatabaseSync(":memory:");
     createT3Schema(t3Db);
-    seedCopilotThread(t3Db, { threadId: "t-small", completedAt, usedTokens: 90_000 });
+    seedCopilotThread(t3Db, { threadId: "t-small", completedAt, usedTokens: 180_000 });
     seedCopilotThread(t3Db, { threadId: "t-big", completedAt, usedTokens: 300_000 });
 
     // Too early (3m00s)
@@ -584,5 +706,102 @@ describe("runSweep end-to-end with mocked CLI", () => {
     saveState(statePath, { version: 1, threads: { t1: { lastCompactedRunId: "r1", compactedAt: "2026-11-23T00:00:00.000Z" } } });
     const loaded = loadState(statePath);
     assert.equal(loaded.threads.t1.lastCompactedRunId, "r1");
+  });
+
+  it("compacts all warm threads immediately with --now defaults (idleMinSec=0, wait=true) in parallel", async () => {
+    const dir = makeTempDir();
+    const t3Home = path.join(dir, ".t3");
+    const userdata = path.join(t3Home, "userdata");
+    fs.mkdirSync(userdata, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(userdata, "settings.json"),
+      JSON.stringify({
+        providerInstances: {
+          "github-copilot": {
+            driver: "acpRegistry",
+            enabled: true,
+            config: { source: "local", agentId: "github-copilot-cli", commandPath: "copilot" },
+          },
+        },
+      }),
+    );
+
+    const t3Db = new DatabaseSync(path.join(userdata, "statev2.sqlite"));
+    createT3Schema(t3Db);
+    const nowIso = "2026-11-23T02:05:00.000Z";
+    const nowMs = Date.parse(nowIso);
+    // Warm thread finished 15s ago (>=200k) -> eligible
+    seedCopilotThread(t3Db, {
+      threadId: "t-fresh",
+      completedAt: new Date(nowMs - 15_000).toISOString(),
+      usedTokens: 280_000,
+    });
+    // Warm thread finished 3m30s ago (>=200k) -> eligible
+    seedCopilotThread(t3Db, {
+      threadId: "t-mid",
+      completedAt: new Date(nowMs - 210_000).toISOString(),
+      usedTokens: 350_000,
+    });
+    // Too small (<200k) -> skipped
+    seedCopilotThread(t3Db, {
+      threadId: "t-small",
+      completedAt: new Date(nowMs - 30_000).toISOString(),
+      usedTokens: 120_000,
+    });
+    // Expired (>285s) -> skipped
+    seedCopilotThread(t3Db, {
+      threadId: "t-cold",
+      completedAt: new Date(nowMs - 320_000).toISOString(),
+      usedTokens: 500_000,
+    });
+    t3Db.close();
+
+    const parsed = parseArgs(["--now"], {});
+    assert.equal(parsed.idleMinSec, 0);
+    assert.equal(parsed.wait, true);
+    assert.equal(parsed.sendTimeoutMs, DEFAULT_CONFIG.waitTimeoutMs);
+
+    const warmOnly = parseArgs(["--warm"], {});
+    assert.equal(warmOnly.idleMinSec, 0);
+    assert.equal(warmOnly.wait, false);
+
+    const noWait = parseArgs(["--now", "--no-wait", "--idle-min", "30"], {});
+    assert.equal(noWait.idleMinSec, 30);
+    assert.equal(noWait.wait, false);
+
+    let activeCount = 0;
+    let maxConcurrent = 0;
+    const calls = [];
+    const fakeExec = async (cmd, args) => {
+      activeCount++;
+      maxConcurrent = Math.max(maxConcurrent, activeCount);
+      calls.push({ cmd, args });
+      await new Promise((r) => setTimeout(r, 20));
+      activeCount--;
+      return { stdout: "Compacted.", stderr: "" };
+    };
+
+    const res = await runSweep({
+      t3Home,
+      copilotHome: path.join(dir, ".copilot"),
+      t3Cli: "/usr/local/bin/t3",
+      statePath: path.join(userdata, "watcher-state.json"),
+      config: { ...DEFAULT_CONFIG, idleMinSec: parsed.idleMinSec, sendTimeoutMs: parsed.sendTimeoutMs },
+      wait: parsed.wait,
+      nowMs,
+      logger: { log() {}, error() {} },
+      execFileFn: fakeExec,
+    });
+
+    assert.equal(res.dispatched.length, 2);
+    assert.equal(maxConcurrent, 2);
+    assert.deepEqual(
+      calls.map((c) => c.args).sort((a, b) => a[5].localeCompare(b[5])),
+      [
+        ["thread", "send", "--wait", "--base-dir", t3Home, "t-fresh", "/compact"],
+        ["thread", "send", "--wait", "--base-dir", t3Home, "t-mid", "/compact"],
+      ],
+    );
   });
 });

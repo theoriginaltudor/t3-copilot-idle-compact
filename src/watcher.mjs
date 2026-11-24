@@ -17,17 +17,30 @@ import {
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_CONFIG = Object.freeze({
-  minTokens: 150_000,
-  idleMinSec: 240, // 4m00s
-  idleMaxSec: 290, // 4m50s (before 5m00s prompt cache expiry)
+  minTokens: 200_000,
+  idleMinSec: 240, // 4m00s from start of last LLM API request
+  idleMaxSec: 285, // 4m45s (leaves >=15s headroom before 5m00s prompt cache expiry)
   pollSec: 15,
   sendTimeoutMs: 30_000,
+  waitTimeoutMs: 180_000,
 });
 
 const ACTIVE_RUN_STATUSES = new Set(["preparing", "starting", "running", "queued"]);
 const PENDING_WORK_STATUSES = new Set(["pending", "starting", "running", "waiting"]);
 const THREAD_ID_PATTERN = /^[A-Za-z0-9:._-]+$/;
 const MAX_STATE_ENTRIES = 500;
+const CLOCK_SKEW_TOLERANCE_MS = 15_000;
+const SQLITE_UTC_DATETIME_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
+export function parseUtcTimestampMs(raw) {
+  if (typeof raw !== "string") return NaN;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return NaN;
+  const normalized = SQLITE_UTC_DATETIME_PATTERN.test(trimmed)
+    ? `${trimmed.replace(" ", "T")}Z`
+    : trimmed;
+  return Date.parse(normalized);
+}
 
 export function parseJsonSafe(raw) {
   if (typeof raw !== "string" || raw.length === 0) return null;
@@ -102,17 +115,39 @@ export function openReadOnlyDb(dbPath) {
 }
 
 /**
- * Read the most recent context token usage for a Copilot CLI session from
- * `~/.copilot/session-store.db` (`assistant_usage_events`).
+ * Read the most recent main-agent usage event for a Copilot CLI session from
+ * `~/.copilot/session-store.db` (`assistant_usage_events`), including both
+ * token usage and the estimated start timestamp of that last API request.
+ *
+ * Anthropic's 5-minute prompt cache TTL starts when the API receives the
+ * request (including after a tool call), not when the response finishes
+ * streaming, so `created_at - duration_ms` tracks the true cache clock.
  */
-export function readCopilotSessionTokens(copilotDb, nativeSessionId) {
+export function readCopilotLatestUsageEvent(copilotDb, nativeSessionId) {
   if (!copilotDb || !nativeSessionId) return null;
   try {
+    const columns = new Set(
+      copilotDb
+        .prepare("PRAGMA table_info(assistant_usage_events)")
+        .all()
+        .map((c) => c.name),
+    );
+    if (columns.size === 0) return null;
+
+    const selectCols = ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"];
+    if (columns.has("duration_ms")) selectCols.push("duration_ms");
+    if (columns.has("created_at")) selectCols.push("created_at");
+    if (columns.has("initiator")) selectCols.push("initiator");
+
+    const whereClauses = ["session_id = ?"];
+    if (columns.has("agent_id")) whereClauses.push("agent_id IS NULL");
+    if (columns.has("parent_tool_call_id")) whereClauses.push("parent_tool_call_id IS NULL");
+
     const row = copilotDb
       .prepare(
-        `SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        `SELECT ${selectCols.join(", ")}
          FROM assistant_usage_events
-         WHERE session_id = ?
+         WHERE ${whereClauses.join(" AND ")}
          ORDER BY id DESC
          LIMIT 1`,
       )
@@ -130,10 +165,67 @@ export function readCopilotSessionTokens(copilotDb, nativeSessionId) {
     // plus output gives a conservative context footprint without double-counting.
     const promptTokens = Math.max(input, cacheRead + cacheWrite);
     const total = promptTokens + output;
-    return total > 0 ? total : null;
+
+    const createdAtMs = parseUtcTimestampMs(row.created_at);
+    const durationMs = toFiniteNonNegInt(row.duration_ms);
+    const requestStartedAtMs = Number.isFinite(createdAtMs) ? createdAtMs - durationMs : null;
+
+    return {
+      usedTokens: total > 0 ? total : null,
+      createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : null,
+      durationMs,
+      requestStartedAtMs,
+      initiator: typeof row.initiator === "string" ? row.initiator : null,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Read the most recent context token usage for a Copilot CLI session from
+ * `~/.copilot/session-store.db` (`assistant_usage_events`).
+ */
+export function readCopilotSessionTokens(copilotDb, nativeSessionId) {
+  return readCopilotLatestUsageEvent(copilotDb, nativeSessionId)?.usedTokens ?? null;
+}
+
+function isUsageEventForRun(usageEvent, runStartMs, runEndMs) {
+  if (!usageEvent || !Number.isFinite(usageEvent.createdAtMs)) return false;
+  if (usageEvent.createdAtMs > runEndMs + CLOCK_SKEW_TOLERANCE_MS) return false;
+  if (Number.isFinite(runStartMs) && usageEvent.createdAtMs < runStartMs - CLOCK_SKEW_TOLERANCE_MS) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Determine the timestamp from which the 5-minute prompt cache TTL is counting.
+ * Prefers the start of the last LLM API request (`created_at - duration_ms`)
+ * from Copilot CLI's `assistant_usage_events` when it matches the latest run,
+ * falling back to T3 Code's `latestRun.completed_at`.
+ */
+export function resolveCacheAnchor({ latestRun, latestRunPayload, copilotUsageEvent }) {
+  const completedMs = parseUtcTimestampMs(latestRun?.completed_at);
+  if (!Number.isFinite(completedMs)) return null;
+
+  const runStartMs = parseUtcTimestampMs(latestRunPayload?.startedAt || latestRun?.requested_at);
+  if (
+    isUsageEventForRun(copilotUsageEvent, runStartMs, completedMs) &&
+    Number.isFinite(copilotUsageEvent.requestStartedAtMs)
+  ) {
+    return {
+      anchorMs: Math.min(completedMs, copilotUsageEvent.requestStartedAtMs),
+      source: "copilot.lastRequestStart",
+      matchedUsageEvent: true,
+    };
+  }
+
+  return {
+    anchorMs: completedMs,
+    source: "t3.completedAt",
+    matchedUsageEvent: false,
+  };
 }
 
 function toFiniteNonNegInt(value) {
@@ -146,8 +238,16 @@ function toFiniteNonNegInt(value) {
  *   2. T3 Code's latest `orchestration_v2_projection_provider_turns.payload_json` (`tokenUsage.usedTokens`)
  *   3. Fallback to Copilot CLI's `session-store.db` (`assistant_usage_events`) via `nativeThreadRef.nativeId`
  */
-export function resolveThreadTokens(t3Db, copilotDb, providerThreadRow) {
-  if (!providerThreadRow) return { usedTokens: null, maxTokens: null, source: "none", nativeSessionId: null };
+export function resolveThreadTokens(t3Db, copilotDb, providerThreadRow, preloadedUsageEvent = undefined) {
+  if (!providerThreadRow) {
+    return {
+      usedTokens: null,
+      maxTokens: null,
+      source: "none",
+      nativeSessionId: null,
+      copilotUsageEvent: null,
+    };
+  }
 
   const ptPayload = parseJsonSafe(providerThreadRow.payload_json) ?? {};
   const nativeSessionId =
@@ -155,10 +255,23 @@ export function resolveThreadTokens(t3Db, copilotDb, providerThreadRow) {
       ? ptPayload.nativeThreadRef.nativeId
       : null;
 
+  const copilotUsageEvent =
+    preloadedUsageEvent !== undefined
+      ? preloadedUsageEvent
+      : nativeSessionId && copilotDb
+        ? readCopilotLatestUsageEvent(copilotDb, nativeSessionId)
+        : null;
+
   const ctxUsed = ptPayload?.contextUsage?.usedTokens;
   const ctxMax = ptPayload?.contextUsage?.maxTokens ?? null;
   if (typeof ctxUsed === "number" && Number.isFinite(ctxUsed) && ctxUsed > 0) {
-    return { usedTokens: Math.floor(ctxUsed), maxTokens: ctxMax, source: "t3.contextUsage", nativeSessionId };
+    return {
+      usedTokens: Math.floor(ctxUsed),
+      maxTokens: ctxMax,
+      source: "t3.contextUsage",
+      nativeSessionId,
+      copilotUsageEvent,
+    };
   }
 
   // Fallback 1: check latest provider_turn tokenUsage in statev2.sqlite
@@ -182,6 +295,7 @@ export function resolveThreadTokens(t3Db, copilotDb, providerThreadRow) {
           maxTokens: tp?.tokenUsage?.maxTokens ?? ctxMax,
           source: "t3.providerTurn",
           nativeSessionId,
+          copilotUsageEvent,
         };
       }
     }
@@ -190,14 +304,17 @@ export function resolveThreadTokens(t3Db, copilotDb, providerThreadRow) {
   }
 
   // Fallback 2: Copilot CLI's own session-store.db
-  if (nativeSessionId && copilotDb) {
-    const copilotUsed = readCopilotSessionTokens(copilotDb, nativeSessionId);
-    if (copilotUsed !== null) {
-      return { usedTokens: copilotUsed, maxTokens: ctxMax, source: "copilot.sessionStore", nativeSessionId };
-    }
+  if (copilotUsageEvent?.usedTokens != null) {
+    return {
+      usedTokens: copilotUsageEvent.usedTokens,
+      maxTokens: ctxMax,
+      source: "copilot.sessionStore",
+      nativeSessionId,
+      copilotUsageEvent,
+    };
   }
 
-  return { usedTokens: null, maxTokens: ctxMax, source: "unknown", nativeSessionId };
+  return { usedTokens: null, maxTokens: ctxMax, source: "unknown", nativeSessionId, copilotUsageEvent };
 }
 
 /**
@@ -245,7 +362,9 @@ export function evaluateThreads({
       latestRunId: null,
       latestRunStatus: null,
       completedAt: null,
+      cacheAnchorAt: null,
       idleMs: null,
+      idleSource: "none",
       usedTokens: null,
       maxTokens: null,
       tokenSource: "none",
@@ -334,20 +453,32 @@ export function evaluateThreads({
       continue;
     }
 
-    const completedMs = Date.parse(latestRun.completed_at);
-    if (!Number.isFinite(completedMs)) {
+    const cacheAnchor = resolveCacheAnchor({
+      latestRun,
+      latestRunPayload,
+      copilotUsageEvent: tokenInfo.copilotUsageEvent,
+    });
+    if (!cacheAnchor) {
       results.push({ ...base, reason: "invalid_completed_at" });
       continue;
     }
 
-    const idleMs = Math.max(0, nowMs - completedMs);
+    const idleMs = Math.max(0, nowMs - cacheAnchor.anchorMs);
+    base.cacheAnchorAt = new Date(cacheAnchor.anchorMs).toISOString();
     base.idleMs = idleMs;
+    base.idleSource = cacheAnchor.source;
 
     // Ensure the latest run belongs to this Copilot provider instance
     const runProviderInstanceId =
       latestRun.provider_instance_id || latestRunPayload.providerInstanceId || providerInstanceId;
     if (runProviderInstanceId !== providerInstanceId) {
       results.push({ ...base, reason: "provider_mismatch" });
+      continue;
+    }
+
+    // Skip if Copilot CLI's latest main-agent event for this run was already a compaction
+    if (cacheAnchor.matchedUsageEvent && tokenInfo.copilotUsageEvent?.initiator === "compaction") {
+      results.push({ ...base, reason: "already_compacted_in_session" });
       continue;
     }
 
@@ -496,7 +627,8 @@ export async function dispatchCompact({
   t3Home,
   threadId,
   dryRun = false,
-  timeoutMs = DEFAULT_CONFIG.sendTimeoutMs,
+  wait = false,
+  timeoutMs = wait ? DEFAULT_CONFIG.waitTimeoutMs : DEFAULT_CONFIG.sendTimeoutMs,
   platform = process.platform,
   execFileFn = execFileAsync,
 }) {
@@ -505,6 +637,9 @@ export async function dispatchCompact({
   }
 
   const cliArgs = ["thread", "send"];
+  if (wait) {
+    cliArgs.push("--wait");
+  }
   if (t3Home) {
     cliArgs.push("--base-dir", t3Home);
   }
@@ -540,6 +675,7 @@ export async function runSweep({
   explicitProviders = [],
   config = DEFAULT_CONFIG,
   dryRun = false,
+  wait = false,
   inFlight = new Set(),
   nowMs = Date.now(),
   logger = console,
@@ -599,12 +735,13 @@ export async function runSweep({
   const dispatched = [];
   const errors = [];
   let stateDirty = false;
+  const toDispatch = [];
 
   for (const item of evaluated) {
     if (!item.eligible) {
       if (verbose) {
         logger.log(
-          `[${isoNow(nowMs)}] skip thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens ?? "?"} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} reason=${item.reason}`,
+          `[${isoNow(nowMs)}] skip thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens ?? "?"} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} (${item.idleSource}) reason=${item.reason}`,
         );
       }
       continue;
@@ -617,6 +754,10 @@ export async function runSweep({
       continue;
     }
 
+    toDispatch.push(item);
+  }
+
+  const dispatchOne = async (item) => {
     inFlight.add(item.threadId);
     try {
       const result = await dispatchCompact({
@@ -624,13 +765,14 @@ export async function runSweep({
         t3Home,
         threadId: item.threadId,
         dryRun,
+        wait,
         timeoutMs: config.sendTimeoutMs,
         execFileFn,
       });
 
       if (dryRun) {
         logger.log(
-          `[${isoNow(nowMs)}] [dry-run] would compact thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} cmd="${result.command}"`,
+          `[${isoNow(nowMs)}] [dry-run] would compact thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} (${item.idleSource}) cmd="${result.command}"`,
         );
       } else {
         state.threads[item.threadId] = {
@@ -638,10 +780,11 @@ export async function runSweep({
           compactedAt: new Date(nowMs).toISOString(),
           usedTokens: item.usedTokens,
           idleSec: Math.floor((item.idleMs ?? 0) / 1000),
+          idleSource: item.idleSource,
         };
         stateDirty = true;
         logger.log(
-          `[${isoNow(nowMs)}] compacted thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} output=${JSON.stringify(result.stdout)}`,
+          `[${isoNow(nowMs)}] compacted thread=${item.threadId} title=${JSON.stringify(item.title)} tokens=${item.usedTokens} (${item.tokenSource}) idle=${formatDuration(item.idleMs)} (${item.idleSource}) output=${JSON.stringify(result.stdout)}`,
         );
       }
 
@@ -654,6 +797,15 @@ export async function runSweep({
       errors.push({ threadId: item.threadId, error: message });
     } finally {
       inFlight.delete(item.threadId);
+    }
+  };
+
+  if (wait && toDispatch.length > 1) {
+    // Dispatch concurrently when waiting so every warm thread hits the API before its 5m cache expires.
+    await Promise.all(toDispatch.map(dispatchOne));
+  } else {
+    for (const item of toDispatch) {
+      await dispatchOne(item);
     }
   }
 
